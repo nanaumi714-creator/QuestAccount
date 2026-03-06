@@ -2,10 +2,12 @@ import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Sparkles, Check, CheckCircle2, ChevronRight, AlertCircle, Zap } from 'lucide-react';
 
-export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void }) {
+export default function ConfirmationQueue({ onConfirm }: { onConfirm: (count?: number) => void }) {
   const [transactions, setTransactions] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [classifyingId, setClassifyingId] = useState<number | null>(null);
+  const [bulkConfirming, setBulkConfirming] = useState(false);
+  const [bulkError, setBulkError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchTransactions();
@@ -28,17 +30,21 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
     try {
       const res = await fetch(`/api/transactions/${id}/auto-classify`, { method: 'POST' });
       const data = await res.json();
-      
+
       if (res.ok) {
-        setTransactions(prev => prev.map(t => 
-          t.id === id ? { 
-            ...t, 
-            household_category: data.household_category,
-            business_category: data.business_category,
-            purpose: data.purpose,
-            confidence: data.confidence
-          } : t
-        ));
+        setTransactions((prev) =>
+          prev.map((t) =>
+            t.id === id
+              ? {
+                  ...t,
+                  household_category: data.household_category,
+                  business_category: data.business_category,
+                  purpose: data.purpose,
+                  confidence: data.confidence,
+                }
+              : t,
+          ),
+        );
       }
     } catch (error) {
       console.error(error);
@@ -57,21 +63,55 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
           business_category: tx.business_category,
           purpose: tx.purpose || 'personal',
           memo: tx.memo,
-          save_rule: true // Automatically save rule on confirm
-        })
+          save_rule: true,
+        }),
       });
 
       if (res.ok) {
-        setTransactions(prev => prev.filter(t => t.id !== id));
-        onConfirm();
+        setTransactions((prev) => prev.filter((t) => t.id !== id));
+        onConfirm(1);
       }
     } catch (error) {
       console.error(error);
     }
   };
 
+  const handleBulkConfirm = async () => {
+    const ids = transactions.map((tx) => tx.id);
+    if (ids.length === 0) return;
+
+    setBulkConfirming(true);
+    setBulkError(null);
+
+    try {
+      const res = await fetch('/api/transactions/bulk-confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ids,
+          household_category: '未分類',
+          business_category: '',
+          purpose: 'personal',
+        }),
+      });
+
+      if (!res.ok) {
+        setBulkError('一括確定に失敗しました。時間を置いて再度お試しください。');
+        return;
+      }
+
+      setTransactions([]);
+      onConfirm(ids.length);
+    } catch (error) {
+      console.error(error);
+      setBulkError('一括確定に失敗しました。時間を置いて再度お試しください。');
+    } finally {
+      setBulkConfirming(false);
+    }
+  };
+
   const updateTransaction = (id: number, field: string, value: any) => {
-    setTransactions(prev => prev.map(t => t.id === id ? { ...t, [field]: value } : t));
+    setTransactions((prev) => prev.map((t) => (t.id === id ? { ...t, [field]: value } : t)));
   };
 
   if (loading) {
@@ -84,7 +124,7 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
 
   if (transactions.length === 0) {
     return (
-      <motion.div 
+      <motion.div
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
         className="flex flex-col items-center justify-center py-24 text-center"
@@ -94,8 +134,7 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
         </div>
         <h2 className="text-3xl font-bold tracking-tight text-slate-900 mb-2">未確認の取引はありません</h2>
         <p className="text-slate-500 max-w-md">
-          素晴らしい！すべての取引の確認が完了しています。
-          新しい取引が追加されるまで、ゆっくりお休みください。
+          素晴らしい！すべての取引の確認が完了しています。 新しい取引が追加されるまで、ゆっくりお休みください。
         </p>
       </motion.div>
     );
@@ -110,11 +149,21 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
             未確認の取引が <span className="font-bold text-indigo-600">{transactions.length}件</span> あります
           </p>
         </div>
-        <button className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-700 rounded-xl font-medium hover:bg-indigo-100 transition-colors">
-          <Check className="w-4 h-4" />
+        <button
+          onClick={handleBulkConfirm}
+          disabled={bulkConfirming}
+          className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-700 rounded-xl font-medium hover:bg-indigo-100 transition-colors disabled:opacity-60"
+        >
+          {bulkConfirming ? (
+            <div className="w-4 h-4 border-2 border-indigo-200 border-t-indigo-600 rounded-full animate-spin" />
+          ) : (
+            <Check className="w-4 h-4" />
+          )}
           すべて確認済みにする
         </button>
       </div>
+
+      {bulkError && <div className="mb-4 text-sm text-rose-600">{bulkError}</div>}
 
       <div className="space-y-4">
         <AnimatePresence>
@@ -127,26 +176,25 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
               className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden transition-all hover:shadow-md"
             >
               <div className="p-4 md:p-5 flex flex-col md:flex-row md:items-center gap-4 md:gap-6">
-                {/* Mobile Header: Store & Amount */}
                 <div className="flex justify-between items-start md:hidden mb-1">
                   <div className="flex-1 min-w-0 pr-4">
                     <div className="text-base font-bold text-slate-900 truncate">{tx.store_name}</div>
                     <div className="text-xs text-slate-500 mt-1">{tx.date}</div>
                   </div>
                   <div className={`text-lg font-bold flex-shrink-0 ${tx.direction === 'expense' ? 'text-slate-900' : 'text-emerald-600'}`}>
-                    {tx.direction === 'expense' ? '-' : '+'}{tx.amount.toLocaleString()}円
+                    {tx.direction === 'expense' ? '-' : '+'}
+                    {tx.amount.toLocaleString()}円
                   </div>
                 </div>
 
-                {/* Desktop: Date & Amount */}
                 <div className="hidden md:block w-32 flex-shrink-0">
                   <div className="text-sm text-slate-500 font-medium mb-1">{tx.date}</div>
                   <div className={`text-xl font-bold ${tx.direction === 'expense' ? 'text-slate-900' : 'text-emerald-600'}`}>
-                    {tx.direction === 'expense' ? '-' : '+'}{tx.amount.toLocaleString()}円
+                    {tx.direction === 'expense' ? '-' : '+'}
+                    {tx.amount.toLocaleString()}円
                   </div>
                 </div>
 
-                {/* Desktop: Store Name */}
                 <div className="hidden md:block flex-1 min-w-0">
                   <div className="text-lg font-bold text-slate-900 truncate">{tx.store_name}</div>
                   <div className="text-sm text-slate-500 truncate mt-1">
@@ -154,7 +202,6 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
                   </div>
                 </div>
 
-                {/* Classification Controls */}
                 <div className="flex flex-row gap-2 md:gap-3 md:flex-1">
                   <div className="flex-1">
                     <select
@@ -171,14 +218,15 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
                     <input
                       type="text"
                       placeholder="カテゴリ"
-                      value={tx.purpose === 'personal' ? (tx.household_category || '') : (tx.business_category || '')}
-                      onChange={(e) => updateTransaction(tx.id, tx.purpose === 'personal' ? 'household_category' : 'business_category', e.target.value)}
+                      value={tx.purpose === 'personal' ? tx.household_category || '' : tx.business_category || ''}
+                      onChange={(e) =>
+                        updateTransaction(tx.id, tx.purpose === 'personal' ? 'household_category' : 'business_category', e.target.value)
+                      }
                       className="w-full text-sm px-3 py-2.5 md:py-2 rounded-xl border border-slate-200 focus:ring-2 focus:ring-indigo-500 outline-none"
                     />
                   </div>
                 </div>
 
-                {/* Actions */}
                 <div className="flex items-center gap-2 mt-1 md:mt-0">
                   <button
                     onClick={() => handleAutoClassify(tx.id)}
@@ -201,8 +249,7 @@ export default function ConfirmationQueue({ onConfirm }: { onConfirm: () => void
                   </button>
                 </div>
               </div>
-              
-              {/* AI Confidence Indicator */}
+
               {tx.confidence && (
                 <div className="px-5 py-2 bg-indigo-50/50 border-t border-indigo-100 flex items-center gap-2 text-xs font-medium text-indigo-700">
                   <Zap className="w-3.5 h-3.5" />

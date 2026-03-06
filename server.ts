@@ -1,10 +1,10 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import Database from 'better-sqlite3';
-import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createAiProviderFromEnv } from './aiProvider';
 
 dotenv.config();
 
@@ -12,6 +12,35 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const db = new Database('accounting.db');
+const ai = createAiProviderFromEnv();
+const VALID_STATUSES = new Set(['confirmed', 'unconfirmed']);
+
+function normalizeStoreName(storeName: string): string {
+  return storeName
+    .trim()
+    .replace(/[\uFF01-\uFF5E]/g, (ch: string) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0));
+}
+
+function validateTransactionStatus(status: unknown): status is 'confirmed' | 'unconfirmed' {
+  return typeof status === 'string' && VALID_STATUSES.has(status);
+}
+
+function createDedupKey(date: string, amount: number, normalizedStoreName: string): string {
+  return `${date}_${amount}_${normalizedStoreName}`;
+}
+
+function sanitizeText(input: unknown, fallback = ''): string {
+  return typeof input === 'string' ? input.trim() : fallback;
+}
+
+function parseAmount(input: unknown): number {
+  if (typeof input === 'number' && Number.isFinite(input)) return Math.round(input);
+  if (typeof input === 'string') {
+    const numeric = Number(input);
+    if (Number.isFinite(numeric)) return Math.round(numeric);
+  }
+  throw new Error('Invalid amount');
+}
 
 // Initialize database schema
 db.exec(`
@@ -57,13 +86,10 @@ db.exec(`
   );
 `);
 
-// Initialize user stats if empty
 const statsCount = db.prepare('SELECT COUNT(*) as count FROM user_stats').get() as { count: number };
 if (statsCount.count === 0) {
   db.prepare('INSERT INTO user_stats (level, exp, streak) VALUES (1, 0, 0)').run();
 }
-
-const ai = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
 
 async function startServer() {
   const app = express();
@@ -71,22 +97,21 @@ async function startServer() {
 
   app.use(express.json({ limit: '10mb' }));
 
-  // API Routes
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', aiProvider: ai?.provider ?? null });
   });
 
-  // Get user stats
   app.get('/api/stats', (req, res) => {
     const stats = db.prepare('SELECT * FROM user_stats LIMIT 1').get();
     res.json(stats);
   });
 
-  // Add EXP
   app.post('/api/stats/exp', (req, res) => {
     const { amount } = req.body;
     const stats = db.prepare('SELECT * FROM user_stats LIMIT 1').get() as any;
-    let newExp = stats.exp + amount;
+    const gain = Number(amount) || 0;
+
+    let newExp = stats.exp + gain;
     let newLevel = stats.level;
     const expNeeded = newLevel * 100;
 
@@ -99,47 +124,70 @@ async function startServer() {
     res.json({ level: newLevel, exp: newExp, leveledUp: newLevel > stats.level });
   });
 
-  // Get transactions
   app.get('/api/transactions', (req, res) => {
-    const { status } = req.query;
-    let query = `
+    const rawStatus = req.query.status;
+    const baseQuery = `
       SELECT t.*, c.household_category, c.business_category, c.purpose, c.confidence
       FROM transactions t
       LEFT JOIN classifications c ON t.id = c.transaction_id
     `;
-    if (status) {
-      query += ` WHERE t.status = '${status}'`;
+
+    if (rawStatus === undefined) {
+      const transactions = db.prepare(`${baseQuery} ORDER BY t.date DESC`).all();
+      res.json(transactions);
+      return;
     }
-    query += ' ORDER BY t.date DESC';
-    const transactions = db.prepare(query).all();
+
+    if (!validateTransactionStatus(rawStatus)) {
+      res.status(400).json({ error: 'Invalid status. Use confirmed or unconfirmed.' });
+      return;
+    }
+
+    const transactions = db
+      .prepare(`${baseQuery} WHERE t.status = ? ORDER BY t.date DESC`)
+      .all(rawStatus);
     res.json(transactions);
   });
 
-  // Add manual transaction
   app.post('/api/transactions', (req, res) => {
-    const { date, amount, store_name, direction, household_category, business_category, purpose, memo } = req.body;
-    
-    const normalized_store_name = store_name.trim().replace(/[\uFF01-\uFF5E]/g, (ch: string) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0));
-    const dedup_key = `${date}_${amount}_${normalized_store_name}`;
+    try {
+      const date = sanitizeText(req.body.date);
+      const amount = parseAmount(req.body.amount);
+      const store_name = sanitizeText(req.body.store_name);
+      const direction = sanitizeText(req.body.direction, 'expense');
+      const household_category = sanitizeText(req.body.household_category);
+      const business_category = sanitizeText(req.body.business_category);
+      const purpose = sanitizeText(req.body.purpose, 'personal');
+      const memo = sanitizeText(req.body.memo);
 
-    const stmt = db.prepare(`
-      INSERT INTO transactions (source, date, amount, store_name, normalized_store_name, direction, dedup_key, status, memo)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
-    `);
-    
-    const info = stmt.run('manual', date, amount, store_name, normalized_store_name, direction, dedup_key, memo);
-    
-    if (household_category || business_category || purpose) {
-      db.prepare(`
-        INSERT INTO classifications (transaction_id, household_category, business_category, purpose, confidence)
-        VALUES (?, ?, ?, ?, 1.0)
-      `).run(info.lastInsertRowid, household_category, business_category, purpose);
+      if (!date || !store_name) {
+        res.status(400).json({ error: 'date and store_name are required' });
+        return;
+      }
+
+      const normalized_store_name = normalizeStoreName(store_name);
+      const dedup_key = createDedupKey(date, amount, normalized_store_name);
+
+      const stmt = db.prepare(`
+        INSERT INTO transactions (source, date, amount, store_name, normalized_store_name, direction, dedup_key, status, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'confirmed', ?)
+      `);
+
+      const info = stmt.run('manual', date, amount, store_name, normalized_store_name, direction, dedup_key, memo);
+
+      if (household_category || business_category || purpose) {
+        db.prepare(`
+          INSERT INTO classifications (transaction_id, household_category, business_category, purpose, confidence)
+          VALUES (?, ?, ?, ?, 1.0)
+        `).run(info.lastInsertRowid, household_category, business_category, purpose);
+      }
+
+      res.json({ id: info.lastInsertRowid });
+    } catch (error) {
+      res.status(400).json({ error: 'Invalid transaction payload' });
     }
-
-    res.json({ id: info.lastInsertRowid });
   });
 
-  // Confirm transaction
   app.post('/api/transactions/:id/confirm', (req, res) => {
     const { id } = req.params;
     const { household_category, business_category, purpose, memo, save_rule } = req.body;
@@ -173,10 +221,14 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // Bulk confirm
   app.post('/api/transactions/bulk-confirm', (req, res) => {
     const { ids, household_category, business_category, purpose } = req.body;
-    
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      res.status(400).json({ error: 'ids is required' });
+      return;
+    }
+
     const updateTx = db.prepare('UPDATE transactions SET status = ? WHERE id = ?');
     const insertClass = db.prepare(`
       INSERT INTO classifications (transaction_id, household_category, business_category, purpose, confidence)
@@ -188,7 +240,7 @@ async function startServer() {
       WHERE transaction_id = ?
     `);
 
-    const transaction = db.transaction((txIds) => {
+    const transaction = db.transaction((txIds: number[]) => {
       for (const id of txIds) {
         updateTx.run('confirmed', id);
         const existing = db.prepare('SELECT id FROM classifications WHERE transaction_id = ?').get(id);
@@ -201,46 +253,30 @@ async function startServer() {
     });
 
     transaction(ids);
-    res.json({ success: true });
+    res.json({ success: true, count: ids.length });
   });
 
-  // Auto classify using AI
   app.post('/api/transactions/:id/auto-classify', async (req, res) => {
     if (!ai) {
-      return res.status(500).json({ error: 'AI not configured' });
+      res.status(500).json({ error: 'AI not configured' });
+      return;
     }
 
     const { id } = req.params;
     const tx = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id) as any;
 
-    if (!tx) return res.status(404).json({ error: 'Not found' });
+    if (!tx) {
+      res.status(404).json({ error: 'Not found' });
+      return;
+    }
 
     try {
-      const prompt = `
-        Analyze this transaction and classify it.
-        Store: ${tx.store_name}
-        Amount: ${tx.amount}
-        Direction: ${tx.direction}
-        Date: ${tx.date}
-
-        Return JSON format:
-        {
-          "household_category": "string (e.g., 食費, 日用品, 通信費, 交通費, 交際費, 趣味, その他)",
-          "business_category": "string (e.g., 消耗品費, 通信費, 旅費交通費, 接待交際費, 会議費, その他) or null",
-          "purpose": "personal" | "business" | "mixed",
-          "confidence": number (0.0 to 1.0)
-        }
-      `;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-        }
+      const result = await ai.classifyTransaction({
+        storeName: tx.store_name,
+        amount: tx.amount,
+        direction: tx.direction,
+        date: tx.date,
       });
-
-      const result = JSON.parse(response.text || '{}');
       res.json(result);
     } catch (error) {
       console.error(error);
@@ -248,9 +284,14 @@ async function startServer() {
     }
   });
 
-  // Bulk Add Transactions (CSV Import)
   app.post('/api/transactions/bulk', (req, res) => {
     const { transactions } = req.body;
+
+    if (!Array.isArray(transactions)) {
+      res.status(400).json({ error: 'transactions must be an array' });
+      return;
+    }
+
     const insertTx = db.prepare(`
       INSERT INTO transactions (source, date, amount, store_name, normalized_store_name, direction, dedup_key, status, memo)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'unconfirmed', ?)
@@ -260,17 +301,34 @@ async function startServer() {
     let added = 0;
     let skipped = 0;
 
-    const runTransaction = db.transaction((txs) => {
+    const runTransaction = db.transaction((txs: any[]) => {
       for (const tx of txs) {
-        const normalized_store_name = tx.store_name.trim().replace(/[\uFF01-\uFF5E]/g, (ch: string) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0));
-        const dedup_key = `${tx.date}_${tx.amount}_${normalized_store_name}`;
+        const date = sanitizeText(tx.date);
+        const store_name = sanitizeText(tx.store_name);
+        if (!date || !store_name) {
+          skipped++;
+          continue;
+        }
+
+        const amount = parseAmount(tx.amount);
+        const normalized_store_name = normalizeStoreName(store_name);
+        const dedup_key = createDedupKey(date, amount, normalized_store_name);
 
         if (checkDup.get(dedup_key)) {
           skipped++;
           continue;
         }
 
-        insertTx.run(tx.source || 'csv', tx.date, tx.amount, tx.store_name, normalized_store_name, tx.direction, dedup_key, tx.memo || '');
+        insertTx.run(
+          tx.source || 'csv',
+          date,
+          amount,
+          store_name,
+          normalized_store_name,
+          tx.direction === 'income' ? 'income' : 'expense',
+          dedup_key,
+          tx.memo || '',
+        );
         added++;
       }
     });
@@ -279,32 +337,15 @@ async function startServer() {
     res.json({ success: true, added, skipped });
   });
 
-  // Receipt OCR
   app.post('/api/ocr', async (req, res) => {
-    if (!ai) return res.status(500).json({ error: 'AI not configured' });
+    if (!ai) {
+      res.status(500).json({ error: 'AI not configured' });
+      return;
+    }
+
     try {
       const { imageBase64, mimeType } = req.body;
-      const prompt = `
-        Extract transaction details from this receipt image.
-        Return ONLY a JSON object with the following structure:
-        {
-          "date": "YYYY-MM-DD",
-          "amount": number (total amount, integer),
-          "store_name": "string",
-          "direction": "expense"
-        }
-      `;
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: {
-          parts: [
-            { inlineData: { data: imageBase64, mimeType } },
-            { text: prompt }
-          ]
-        },
-        config: { responseMimeType: 'application/json' }
-      });
-      const result = JSON.parse(response.text || '{}');
+      const result = await ai.readReceipt({ imageBase64, mimeType });
       res.json(result);
     } catch (error) {
       console.error(error);
@@ -312,7 +353,6 @@ async function startServer() {
     }
   });
 
-  // Export Freee CSV
   app.get('/api/export/freee', (req, res) => {
     const query = `
       SELECT t.*, c.business_category, c.purpose 
@@ -324,16 +364,14 @@ async function startServer() {
     const transactions = db.prepare(query).all() as any[];
 
     let csv = '収支区分,発生日,勘定科目,金額,取引先,備考\n';
-    
-    transactions.forEach(tx => {
+
+    transactions.forEach((tx) => {
       const type = tx.direction === 'expense' ? '支出' : '収入';
-      const date = tx.date;
       const category = tx.business_category || '未分類';
-      const amount = tx.amount;
       const store = `"${tx.store_name.replace(/"/g, '""')}"`;
       const memo = `"${(tx.memo || '').replace(/"/g, '""')}"`;
-      
-      csv += `${type},${date},${category},${amount},${store},${memo}\n`;
+
+      csv += `${type},${tx.date},${category},${tx.amount},${store},${memo}\n`;
     });
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -341,7 +379,6 @@ async function startServer() {
     res.send('\uFEFF' + csv);
   });
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
