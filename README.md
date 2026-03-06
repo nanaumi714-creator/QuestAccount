@@ -18,3 +18,19 @@ View your app in AI Studio: https://ai.studio/apps/e1f38639-6564-414f-bf29-f3c5b
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+
+## AI Provider Configuration
+
+This app supports both Gemini and OpenAI for classification/OCR.
+
+1. Copy `.env.example` to `.env.local`
+2. Set `AI_PROVIDER` to `gemini` or `openai`
+3. Configure the matching API key (`GEMINI_API_KEY` or `OPENAI_API_KEY`)
+
+## Scripts
+
+- `npm run dev`: Start full-stack dev server (`tsx server.ts`)
+- `npm run lint`: Type-check TypeScript (`tsc --noEmit`)
+- `npm run build`: Build front-end assets with Vite
+- `npm run start`: Start server with tsx (`tsx server.ts`)

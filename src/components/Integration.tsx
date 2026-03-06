@@ -2,10 +2,124 @@ import React, { useState } from 'react';
 import { motion } from 'motion/react';
 import { Upload, FileText, Download, Camera, CheckCircle2, AlertCircle } from 'lucide-react';
 
+type ImportSummary = {
+  parsed: number;
+  failed: number;
+  added: number;
+  skipped: number;
+};
+
+const DATE_KEYS = ['date', '日付', '取引日', '利用日'];
+const AMOUNT_KEYS = ['amount', '金額', '利用金額', '支払金額'];
+const STORE_KEYS = ['store_name', '店舗名', '利用店名', '内容', '摘要', '支払先'];
+
+type CsvRow = Record<string, string>;
+
+function parseCsvLine(line: string): string[] {
+  const result: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (ch === ',' && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+      continue;
+    }
+
+    current += ch;
+  }
+
+  result.push(current.trim());
+  return result;
+}
+
+function isLikelyHeader(cols: string[]): boolean {
+  const normalized = cols.map((c) => c.trim().toLowerCase());
+  const keySet = new Set([...DATE_KEYS, ...AMOUNT_KEYS, ...STORE_KEYS].map((k) => k.toLowerCase()));
+  return normalized.some((cell) => keySet.has(cell));
+}
+
+function parseCsvRows(csvText: string): { rows: CsvRow[]; hasHeader: boolean } {
+  const lines = csvText.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return { rows: [], hasHeader: false };
+
+  const firstCols = parseCsvLine(lines[0]);
+  const hasHeader = isLikelyHeader(firstCols);
+
+  if (hasHeader) {
+    const headers = firstCols;
+    return {
+      hasHeader: true,
+      rows: lines.slice(1).map((line) => {
+        const cols = parseCsvLine(line);
+        const row: CsvRow = {};
+        headers.forEach((header, idx) => {
+          row[header] = cols[idx] ?? '';
+        });
+        return row;
+      }),
+    };
+  }
+
+  return {
+    hasHeader: false,
+    rows: lines.map((line) => {
+      const cols = parseCsvLine(line);
+      const row: CsvRow = {};
+      cols.forEach((value, idx) => {
+        row[`col_${idx}`] = value;
+      });
+      return row;
+    }),
+  };
+}
+
+function findValue(row: CsvRow, keys: string[]): string {
+  for (const key of keys) {
+    const value = row[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function findValueWithoutHeader(row: CsvRow, type: 'date' | 'amount' | 'store'): string {
+  const values = Object.values(row).map((v) => v.trim()).filter(Boolean);
+
+  if (type === 'date') {
+    return values.find((v) => /^\d{4}[/-]\d{1,2}[/-]\d{1,2}$/.test(v)) || '';
+  }
+  if (type === 'amount') {
+    return values.find((v) => /^-?[¥\d,\s]+$/.test(v) && /\d/.test(v)) || '';
+  }
+  return values.find((v) => !/^[-?¥\d,\s/]+$/.test(v) && v.length > 1) || '';
+}
+
+function normalizeDate(dateText: string): string {
+  return dateText.replace(/\//g, '-');
+}
+
+function normalizeAmount(amountText: string): number | null {
+  const normalized = amountText.replace(/[¥,\s]/g, '');
+  const amount = Number(normalized);
+  return Number.isFinite(amount) && amount !== 0 ? Math.abs(Math.round(amount)) : null;
+}
+
 export default function Integration({ onAdd }: { onAdd: (exp: number) => void }) {
   const [ocrLoading, setOcrLoading] = useState(false);
   const [csvLoading, setCsvLoading] = useState(false);
-  const [message, setMessage] = useState<{type: 'success'|'error', text: string} | null>(null);
+  const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -22,27 +136,41 @@ export default function Integration({ onAdd }: { onAdd: (exp: number) => void })
   const processCSV = async (csvText: string) => {
     setCsvLoading(true);
     setMessage(null);
+
     try {
-      const lines = csvText.split('\n').filter(l => l.trim());
-      const parsed = [];
-      for (const line of lines) {
-        const cols = line.split(',').map(c => c.replace(/^"|"$/g, '').trim());
-        const dateCol = cols.find(c => /^\d{4}[-/]\d{2}[-/]\d{2}$/.test(c));
-        const amountCol = cols.find(c => /^-?\d+$/.test(c) && Math.abs(parseInt(c)) > 0);
-        const storeCol = cols.find(c => c !== dateCol && c !== amountCol && isNaN(Number(c)) && c.length > 0);
+      const { rows, hasHeader } = parseCsvRows(csvText);
 
-        if (dateCol && amountCol && storeCol) {
-          parsed.push({
-            date: dateCol.replace(/\//g, '-'),
-            amount: Math.abs(parseInt(amountCol)),
-            store_name: storeCol,
-            direction: parseInt(amountCol) < 0 ? 'income' : 'expense',
-            source: 'csv'
-          });
-        }
-      }
+      let parsed = 0;
+      let failed = 0;
+      const transactions = rows
+        .map((row) => {
+          const dateRaw = hasHeader ? findValue(row, DATE_KEYS) : findValueWithoutHeader(row, 'date');
+          const amountRaw = hasHeader ? findValue(row, AMOUNT_KEYS) : findValueWithoutHeader(row, 'amount');
+          const storeName = hasHeader ? findValue(row, STORE_KEYS) : findValueWithoutHeader(row, 'store');
 
-      if (parsed.length === 0) {
+          if (!dateRaw || !amountRaw || !storeName) {
+            failed++;
+            return null;
+          }
+
+          const amountNumeric = normalizeAmount(amountRaw);
+          if (amountNumeric === null) {
+            failed++;
+            return null;
+          }
+
+          parsed++;
+          return {
+            date: normalizeDate(dateRaw),
+            amount: amountNumeric,
+            store_name: storeName,
+            direction: amountRaw.trim().startsWith('-') ? 'income' : 'expense',
+            source: 'csv',
+          };
+        })
+        .filter((row): row is NonNullable<typeof row> => Boolean(row));
+
+      if (transactions.length === 0) {
         setMessage({ type: 'error', text: 'CSVから取引データを抽出できませんでした。フォーマットを確認してください。' });
         return;
       }
@@ -50,14 +178,26 @@ export default function Integration({ onAdd }: { onAdd: (exp: number) => void })
       const res = await fetch('/api/transactions/bulk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transactions: parsed })
+        body: JSON.stringify({ transactions }),
       });
       const data = await res.json();
-      
-      if (res.ok) {
-        setMessage({ type: 'success', text: `${data.added}件の取引をインポートしました（重複スキップ: ${data.skipped}件）` });
-        onAdd(data.added * 2); // 2 EXP per imported tx
+
+      if (!res.ok) {
+        setMessage({ type: 'error', text: 'インポート中にエラーが発生しました。' });
+        return;
       }
+
+      const summary: ImportSummary = {
+        parsed,
+        failed,
+        added: data.added ?? 0,
+        skipped: data.skipped ?? 0,
+      };
+      setMessage({
+        type: 'success',
+        text: `取込完了: 解析 ${summary.parsed}件 / 登録 ${summary.added}件 / 重複スキップ ${summary.skipped}件 / 失敗 ${summary.failed}件`,
+      });
+      onAdd(summary.added * 2);
     } catch (error) {
       setMessage({ type: 'error', text: 'インポート中にエラーが発生しました。' });
     } finally {
@@ -84,23 +224,22 @@ export default function Integration({ onAdd }: { onAdd: (exp: number) => void })
       const res = await fetch('/api/ocr', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64, mimeType })
+        body: JSON.stringify({ imageBase64, mimeType }),
       });
       const data = await res.json();
 
       if (res.ok && data.date && data.amount && data.store_name) {
-        // Add to transactions
         const addRes = await fetch('/api/transactions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             ...data,
-            source: 'ocr'
-          })
+            source: 'ocr',
+          }),
         });
         if (addRes.ok) {
           setMessage({ type: 'success', text: `レシートを読み取りました: ${data.store_name} (${data.amount}円)` });
-          onAdd(10); // 10 EXP for OCR
+          onAdd(10);
         }
       } else {
         setMessage({ type: 'error', text: 'レシートの読み取りに失敗しました。画像が不鮮明な可能性があります。' });
@@ -120,7 +259,7 @@ export default function Integration({ onAdd }: { onAdd: (exp: number) => void })
       </div>
 
       {message && (
-        <motion.div 
+        <motion.div
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
           className={`p-4 rounded-xl flex items-center gap-3 ${
@@ -133,7 +272,6 @@ export default function Integration({ onAdd }: { onAdd: (exp: number) => void })
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
-        {/* CSV Import */}
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 md:p-6">
           <div className="w-12 h-12 bg-indigo-100 text-indigo-600 rounded-xl flex items-center justify-center mb-4">
             <FileText className="w-6 h-6" />
@@ -157,7 +295,6 @@ export default function Integration({ onAdd }: { onAdd: (exp: number) => void })
           </label>
         </div>
 
-        {/* Receipt OCR */}
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 md:p-6">
           <div className="w-12 h-12 bg-emerald-100 text-emerald-600 rounded-xl flex items-center justify-center mb-4">
             <Camera className="w-6 h-6" />
@@ -181,7 +318,6 @@ export default function Integration({ onAdd }: { onAdd: (exp: number) => void })
           </label>
         </div>
 
-        {/* Export */}
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-5 md:p-6 md:col-span-2">
           <div className="w-12 h-12 bg-orange-100 text-orange-600 rounded-xl flex items-center justify-center mb-4">
             <Download className="w-6 h-6" />
@@ -190,7 +326,7 @@ export default function Integration({ onAdd }: { onAdd: (exp: number) => void })
           <p className="text-slate-500 text-sm mb-6">
             確認済みの「事業用」「共通（按分）」取引を、会計ソフト（freee / マネーフォワード等）にインポートできる形式でダウンロードします。
           </p>
-          <button 
+          <button
             onClick={() => window.open('/api/export/freee', '_blank')}
             className="flex items-center gap-2 px-6 py-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-medium transition-colors"
           >

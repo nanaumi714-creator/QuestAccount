@@ -49,13 +49,13 @@ export default function App() {
       case 'dashboard':
         return <Dashboard />;
       case 'queue':
-        return <ConfirmationQueue onConfirm={() => handleExpGain(10)} />;
+        return <ConfirmationQueue onConfirm={(count = 1) => handleExpGain(10 * count)} />;
       case 'input':
         return <ManualInput onAdd={() => handleExpGain(5)} />;
       case 'integration':
         return <Integration onAdd={(exp) => handleExpGain(exp)} />;
       default:
-        return <ConfirmationQueue onConfirm={() => handleExpGain(10)} />;
+        return <ConfirmationQueue onConfirm={(count = 1) => handleExpGain(10 * count)} />;
     }
   };
 
